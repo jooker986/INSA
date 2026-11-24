@@ -9,8 +9,8 @@ from telebot import types
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-if not BOT_TOKEN or not ADMIN_ID:
-    raise ValueError("خطأ: تأكد من إضافة BOT_TOKEN و ADMIN_ID في GitHub Secrets")
+if not BOT_TOKEN:
+    raise ValueError("خطأ: تأكد من إضافة BOT_TOKEN في GitHub Secrets")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 DB_PATH = "instapay_data.db"
@@ -41,9 +41,20 @@ def calculate_instapay_fee(amount: float) -> float:
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # جدول المستخدمين لتسجيل كل مستخدم جديد
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            full_name TEXT,
+            username TEXT,
+            joined_at TEXT
+        )
+    """)
+    # جدول العمليات مربوط بـ user_id لكل مستخدم
     c.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
             type TEXT NOT NULL,
             amount REAL NOT NULL,
             fee REAL DEFAULT 0.0,
@@ -58,7 +69,19 @@ def init_db():
     conn.close()
 
 
-def get_balance() -> float:
+def register_user(user):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %I:%M %p")
+    c.execute("""
+        INSERT OR IGNORE INTO users (user_id, full_name, username, joined_at)
+        VALUES (?, ?, ?, ?)
+    """, (user.id, user.full_name, user.username or "", now))
+    conn.commit()
+    conn.close()
+
+
+def get_balance(user_id: int) -> float:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
@@ -70,13 +93,14 @@ def get_balance() -> float:
             END
         ), 0)
         FROM transactions
-    """)
+        WHERE user_id = ?
+    """, (user_id,))
     bal = c.fetchone()[0]
     conn.close()
     return round(bal, 2)
 
 
-def get_limits_usage():
+def get_limits_usage(user_id: int):
     now = datetime.now()
     today_str = now.strftime("%Y-%m-%d")
     month_str = now.strftime("%Y-%m")
@@ -84,25 +108,32 @@ def get_limits_usage():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
-    c.execute("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='out' AND date_day=?", (today_str,))
+    c.execute("""
+        SELECT COALESCE(SUM(amount), 0) FROM transactions
+        WHERE user_id = ? AND type='out' AND date_day=?
+    """, (user_id, today_str))
     daily_used = c.fetchone()[0]
 
-    c.execute("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE type='out' AND date_month=?", (month_str,))
+    c.execute("""
+        SELECT COALESCE(SUM(amount), 0) FROM transactions
+        WHERE user_id = ? AND type='out' AND date_month=?
+    """, (user_id, month_str))
     monthly_used = c.fetchone()[0]
 
     conn.close()
     return round(daily_used, 2), round(monthly_used, 2)
 
 
-def add_transaction(tx_type: str, amount: float, fee: float, note: str):
+def add_transaction(user_id: int, tx_type: str, amount: float, fee: float, note: str):
     now = datetime.now()
     total = round(amount + fee, 2) if tx_type == "out" else round(amount, 2)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        INSERT INTO transactions (type, amount, fee, total, note, date_day, date_month, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO transactions (user_id, type, amount, fee, total, note, date_day, date_month, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
+        user_id,
         tx_type,
         amount,
         fee,
@@ -116,22 +147,22 @@ def add_transaction(tx_type: str, amount: float, fee: float, note: str):
     conn.close()
 
 
-def get_recent_transactions(limit=15):
+def get_recent_transactions(user_id: int, limit=15):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
         SELECT id, type, amount, fee, total, note, created_at
-        FROM transactions ORDER BY id DESC LIMIT ?
-    """, (limit,))
+        FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT ?
+    """, (user_id, limit))
     rows = c.fetchall()
     conn.close()
     return rows
 
 
-def delete_last_transaction():
+def delete_last_transaction(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT id, type, total, note FROM transactions ORDER BY id DESC LIMIT 1")
+    c.execute("SELECT id, type, total, note FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,))
     last = c.fetchone()
     if last:
         c.execute("DELETE FROM transactions WHERE id = ?", (last[0],))
@@ -140,11 +171,22 @@ def delete_last_transaction():
     return last
 
 
+def get_admin_stats():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users")
+    users_count = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM transactions")
+    tx_count = c.fetchone()[0]
+    conn.close()
+    return users_count, tx_count
+
+
 def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
+    return ADMIN_ID != 0 and user_id == ADMIN_ID
 
 
-def main_menu_keyboard():
+def main_menu_keyboard(user_id: int):
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
         types.InlineKeyboardButton("➕ استلام / إيداع", callback_data="tx_in"),
@@ -159,20 +201,25 @@ def main_menu_keyboard():
         types.InlineKeyboardButton("↩️ تراجع عن آخر عملية", callback_data="undo_confirm"),
     )
     kb.add(
-        types.InlineKeyboardButton("💾 نسخة احتياطية (DB)", callback_data="backup"),
         types.InlineKeyboardButton("🔄 استعلام / تحديث الرصيد", callback_data="refresh"),
     )
+    # أزرار خاصة بك كأدمن فقط
+    if is_admin(user_id):
+        kb.add(
+            types.InlineKeyboardButton("👑 إحصائيات البوت", callback_data="admin_stats"),
+            types.InlineKeyboardButton("💾 نسخة احتياطية (DB)", callback_data="backup"),
+        )
     return kb
 
 
-def main_dashboard_text():
-    bal = get_balance()
-    daily_used, _ = get_limits_usage()
+def main_dashboard_text(user_id: int):
+    bal = get_balance(user_id)
+    daily_used, _ = get_limits_usage(user_id)
     daily_rem = max(0.0, MAX_DAILY_LIMIT - daily_used)
     return (
         f"💳 <b>مدير حساب InstaPay الشخصي</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💰 <b>الرصيد الحالي:</b> <code>{bal:,.2f} ج.م</code>\n"
+        f"💰 <b>رصيدك الحالي:</b> <code>{bal:,.2f} ج.م</code>\n"
         f"📉 <b>المتبقي من حد اليوم:</b> <code>{daily_rem:,.2f} ج.م</code>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"اختر العملية المطلوبة:"
@@ -181,18 +228,15 @@ def main_dashboard_text():
 
 @bot.message_handler(commands=["start", "balance"])
 def handle_start(message):
-    if not is_admin(message.from_user.id):
-        return
-    user_states.pop(message.from_user.id, None)
-    bot.send_message(message.chat.id, main_dashboard_text(), reply_markup=main_menu_keyboard())
+    register_user(message.from_user)
+    uid = message.from_user.id
+    user_states.pop(uid, None)
+    bot.send_message(message.chat.id, main_dashboard_text(uid), reply_markup=main_menu_keyboard(uid))
 
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔ غير مصرح لك.")
-        return
-
+    register_user(call.from_user)
     uid = call.from_user.id
     data = call.data
 
@@ -200,10 +244,10 @@ def handle_callbacks(call):
         user_states.pop(uid, None)
         try:
             bot.edit_message_text(
-                main_dashboard_text(),
+                main_dashboard_text(uid),
                 call.message.chat.id,
                 call.message.message_id,
-                reply_markup=main_menu_keyboard()
+                reply_markup=main_menu_keyboard(uid)
             )
         except Exception:
             pass
@@ -230,18 +274,18 @@ def handle_callbacks(call):
         state = user_states.get(uid)
         if state and state.get("step") == "note":
             tx_type = "in" if state["mode"] == "tx_in" else "out"
-            add_transaction(tx_type, state["amount"], state["fee"], "")
+            add_transaction(uid, tx_type, state["amount"], state["fee"], "")
             user_states.pop(uid, None)
             bot.edit_message_text(
-                f"✅ <b>تم تسجيل العملية بنجاح!</b>\n\n{main_dashboard_text()}",
+                f"✅ <b>تم تسجيل العملية بنجاح!</b>\n\n{main_dashboard_text(uid)}",
                 call.message.chat.id,
                 call.message.message_id,
-                reply_markup=main_menu_keyboard()
+                reply_markup=main_menu_keyboard(uid)
             )
         bot.answer_callback_query(call.id)
 
     elif data == "limits":
-        daily_used, monthly_used = get_limits_usage()
+        daily_used, monthly_used = get_limits_usage(uid)
         daily_rem = max(0.0, MAX_DAILY_LIMIT - daily_used)
         monthly_rem = max(0.0, MAX_MONTHLY_LIMIT - monthly_used)
 
@@ -264,7 +308,7 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id)
 
     elif data == "history":
-        rows = get_recent_transactions(15)
+        rows = get_recent_transactions(uid, 15)
         if not rows:
             bot.answer_callback_query(call.id, "لا توجد عمليات مسجلة بعد.", show_alert=True)
             return
@@ -297,25 +341,33 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id)
 
     elif data == "undo_exec":
-        deleted = delete_last_transaction()
+        deleted = delete_last_transaction(uid)
         if deleted:
             bot.answer_callback_query(call.id, f"تم حذف العملية ({deleted[2]:,.2f} ج.م) ✅", show_alert=True)
         else:
             bot.answer_callback_query(call.id, "مفيش عمليات للحذف.", show_alert=True)
         bot.edit_message_text(
-            main_dashboard_text(),
+            main_dashboard_text(uid),
             call.message.chat.id,
             call.message.message_id,
-            reply_markup=main_menu_keyboard()
+            reply_markup=main_menu_keyboard(uid)
         )
 
-    elif data == "backup":
+    elif data == "admin_stats" and is_admin(uid):
+        users_count, tx_count = get_admin_stats()
+        bot.answer_callback_query(
+            call.id,
+            f"👑 إحصائيات البوت:\n👥 عدد المستخدمين: {users_count}\n📊 إجمالي العمليات: {tx_count}",
+            show_alert=True
+        )
+
+    elif data == "backup" and is_admin(uid):
         if os.path.exists(DB_PATH):
             with open(DB_PATH, "rb") as f:
                 bot.send_document(
                     call.message.chat.id,
                     f,
-                    caption=f"💾 نسخة احتياطية من قاعدة البيانات\n📅 {datetime.now().strftime('%Y-%m-%d %I:%M %p')}"
+                    caption=f"💾 نسخة احتياطية كاملة\n📅 {datetime.now().strftime('%Y-%m-%d %I:%M %p')}"
                 )
             bot.answer_callback_query(call.id, "تم إرسال الملف ✅")
         else:
@@ -324,14 +376,12 @@ def handle_callbacks(call):
 
 @bot.message_handler(func=lambda m: True)
 def handle_inputs(message):
-    if not is_admin(message.from_user.id):
-        return
-
+    register_user(message.from_user)
     uid = message.from_user.id
     state = user_states.get(uid)
 
     if not state:
-        bot.send_message(message.chat.id, main_dashboard_text(), reply_markup=main_menu_keyboard())
+        bot.send_message(message.chat.id, main_dashboard_text(uid), reply_markup=main_menu_keyboard(uid))
         return
 
     if state["step"] == "amount":
@@ -346,8 +396,8 @@ def handle_inputs(message):
 
             warnings = []
             if mode in ("tx_out_fee", "tx_out_nofee"):
-                current_bal = get_balance()
-                daily_used, monthly_used = get_limits_usage()
+                current_bal = get_balance(uid)
+                daily_used, monthly_used = get_limits_usage(uid)
 
                 if total > current_bal:
                     warnings.append(f"⚠️ تنبيه: المبلغ الإجمالي ({total:,.2f}) أكبر من رصيدك المسجل ({current_bal:,.2f})!")
@@ -380,16 +430,16 @@ def handle_inputs(message):
     elif state["step"] == "note":
         note = "" if message.text.strip() == "-" else message.text.strip()
         tx_type = "in" if state["mode"] == "tx_in" else "out"
-        add_transaction(tx_type, state["amount"], state["fee"], note)
+        add_transaction(uid, tx_type, state["amount"], state["fee"], note)
         user_states.pop(uid, None)
         bot.send_message(
             message.chat.id,
-            f"✅ <b>تم تسجيل العملية بنجاح!</b>\n\n{main_dashboard_text()}",
-            reply_markup=main_menu_keyboard()
+            f"✅ <b>تم تسجيل العملية بنجاح!</b>\n\n{main_dashboard_text(uid)}",
+            reply_markup=main_menu_keyboard(uid)
         )
 
 
 if __name__ == "__main__":
     init_db()
-    print("🚀 InstaPay-Manager Bot is running on GitHub Actions...")
+    print("🚀 Multi-user InstaPay-Manager Bot is running...")
     bot.infinity_polling(timeout=30, long_polling_timeout=20)
