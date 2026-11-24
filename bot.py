@@ -2,6 +2,8 @@ import os
 import signal
 import sys
 import sqlite3
+import subprocess
+import threading
 from datetime import datetime
 import telebot
 from telebot import types
@@ -20,10 +22,30 @@ MAX_DAILY_LIMIT = 120000.0
 MAX_MONTHLY_LIMIT = 400000.0
 
 user_states = {}
+git_lock = threading.Lock()
+
+
+def sync_db_to_github():
+    """رفع قاعدة البيانات فوراً إلى GitHub بعد أي تعديل"""
+    def _push():
+        with git_lock:
+            try:
+                subprocess.run(["git", "config", "--local", "user.email", "action@github.com"], check=False)
+                subprocess.run(["git", "config", "--local", "user.name", "GitHub Action"], check=False)
+                subprocess.run(["git", "add", DB_PATH], check=False)
+                status = subprocess.run(["git", "status", "--porcelain", DB_PATH], capture_output=True, text=True)
+                if status.stdout.strip():
+                    subprocess.run(["git", "commit", "-m", "Instant DB backup"], check=False)
+                    subprocess.run(["git", "pull", "--rebase", "origin", "main"], check=False)
+                    subprocess.run(["git", "push", "origin", "main"], check=False)
+            except Exception as e:
+                print(f"Git sync error: {e}")
+
+    threading.Thread(target=_push, daemon=True).start()
 
 
 def graceful_exit(signum, frame):
-    print("Stopping bot gracefully to save database...")
+    print("Stopping bot gracefully...")
     bot.stop_polling()
     sys.exit(0)
 
@@ -41,7 +63,6 @@ def calculate_instapay_fee(amount: float) -> float:
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # جدول المستخدمين لتسجيل كل مستخدم جديد
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -50,7 +71,6 @@ def init_db():
             joined_at TEXT
         )
     """)
-    # جدول العمليات مربوط بـ user_id لكل مستخدم
     c.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,6 +165,7 @@ def add_transaction(user_id: int, tx_type: str, amount: float, fee: float, note:
     ))
     conn.commit()
     conn.close()
+    sync_db_to_github()
 
 
 def get_recent_transactions(user_id: int, limit=15):
@@ -168,6 +189,8 @@ def delete_last_transaction(user_id: int):
         c.execute("DELETE FROM transactions WHERE id = ?", (last[0],))
         conn.commit()
     conn.close()
+    if last:
+        sync_db_to_github()
     return last
 
 
@@ -203,7 +226,6 @@ def main_menu_keyboard(user_id: int):
     kb.add(
         types.InlineKeyboardButton("🔄 استعلام / تحديث الرصيد", callback_data="refresh"),
     )
-    # أزرار خاصة بك كأدمن فقط
     if is_admin(user_id):
         kb.add(
             types.InlineKeyboardButton("👑 إحصائيات البوت", callback_data="admin_stats"),
@@ -362,14 +384,15 @@ def handle_callbacks(call):
         )
 
     elif data == "backup" and is_admin(uid):
+        sync_db_to_github()
         if os.path.exists(DB_PATH):
             with open(DB_PATH, "rb") as f:
                 bot.send_document(
                     call.message.chat.id,
                     f,
-                    caption=f"💾 نسخة احتياطية كاملة\n📅 {datetime.now().strftime('%Y-%m-%d %I:%M %p')}"
+                    caption=f"💾 نسخة احتياطية كاملة (وتم الرفع إلى GitHub)\n📅 {datetime.now().strftime('%Y-%m-%d %I:%M %p')}"
                 )
-            bot.answer_callback_query(call.id, "تم إرسال الملف ✅")
+            bot.answer_callback_query(call.id, "تم إرسال الملف ورفعه ✅")
         else:
             bot.answer_callback_query(call.id, "لا توجد بيانات بعد.")
 
@@ -441,5 +464,6 @@ def handle_inputs(message):
 
 if __name__ == "__main__":
     init_db()
+    sync_db_to_github()
     print("🚀 Multi-user InstaPay-Manager Bot is running...")
     bot.infinity_polling(timeout=30, long_polling_timeout=20)
