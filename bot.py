@@ -27,10 +27,16 @@ MAX_MONTHLY_LIMIT = 400000.0
 
 user_states = {}
 git_lock = threading.Lock()
+db_lock = threading.Lock()
 
 
-def sync_db_to_github():
-    """رفع قاعدة البيانات فوراً إلى GitHub بعد أي تعديل"""
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
+    return conn
+
+
+def sync_db_to_github(blocking=False):
+    """رفع قاعدة البيانات فوراً إلى GitHub بعد أي تعديل مع منع التعارض"""
     def _push():
         with git_lock:
             try:
@@ -40,17 +46,21 @@ def sync_db_to_github():
                 status = subprocess.run(["git", "status", "--porcelain", DB_PATH], capture_output=True, text=True)
                 if status.stdout.strip():
                     subprocess.run(["git", "commit", "-m", "Instant DB backup"], check=False)
-                    subprocess.run(["git", "pull", "--rebase", "origin", "main"], check=False)
-                    subprocess.run(["git", "push", "origin", "main"], check=False)
+                    subprocess.run(["git", "pull", "--no-rebase", "-X", "ours", "origin", "HEAD"], check=False)
+                    subprocess.run(["git", "push", "origin", "HEAD"], check=False)
             except Exception as e:
                 print(f"Git sync error: {e}")
 
-    threading.Thread(target=_push, daemon=True).start()
+    if blocking:
+        _push()
+    else:
+        threading.Thread(target=_push, daemon=False).start()
 
 
 def graceful_exit(signum, frame):
-    print("Stopping bot gracefully...")
+    print("Stopping bot gracefully and saving final DB state...")
     bot.stop_polling()
+    sync_db_to_github(blocking=True)
     sys.exit(0)
 
 
@@ -98,62 +108,65 @@ def calculate_instapay_fee(amount: float) -> float:
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT,
-            username TEXT,
-            joined_at TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            type TEXT NOT NULL,
-            amount REAL NOT NULL,
-            fee REAL DEFAULT 0.0,
-            total REAL NOT NULL,
-            note TEXT,
-            date_day TEXT NOT NULL,
-            date_month TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
+    with db_lock:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                full_name TEXT,
+                username TEXT,
+                joined_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                type TEXT NOT NULL,
+                amount REAL NOT NULL,
+                fee REAL DEFAULT 0.0,
+                total REAL NOT NULL,
+                note TEXT,
+                date_day TEXT NOT NULL,
+                date_month TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
 
 
 def register_user(user):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    now = datetime.now().strftime("%Y-%m-%d %I:%M %p")
-    c.execute("""
-        INSERT OR IGNORE INTO users (user_id, full_name, username, joined_at)
-        VALUES (?, ?, ?, ?)
-    """, (user.id, user.full_name, user.username or "", now))
-    conn.commit()
-    conn.close()
+    with db_lock:
+        conn = get_db_connection()
+        c = conn.cursor()
+        now = datetime.now().strftime("%Y-%m-%d %I:%M %p")
+        c.execute("""
+            INSERT OR IGNORE INTO users (user_id, full_name, username, joined_at)
+            VALUES (?, ?, ?, ?)
+        """, (user.id, user.full_name, user.username or "", now))
+        conn.commit()
+        conn.close()
 
 
 def get_balance(user_id: int) -> float:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        SELECT COALESCE(SUM(
-            CASE 
-                WHEN type='in' THEN total 
-                WHEN type='out' THEN -total 
-                ELSE 0 
-            END
-        ), 0)
-        FROM transactions
-        WHERE user_id = ?
-    """, (user_id,))
-    bal = c.fetchone()[0]
-    conn.close()
+    with db_lock:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("""
+            SELECT COALESCE(SUM(
+                CASE 
+                    WHEN type='in' THEN total 
+                    WHEN type='out' THEN -total 
+                    ELSE 0 
+                END
+            ), 0)
+            FROM transactions
+            WHERE user_id = ?
+        """, (user_id,))
+        bal = c.fetchone()[0]
+        conn.close()
     return round(bal, 2)
 
 
@@ -162,83 +175,88 @@ def get_limits_usage(user_id: int):
     today_str = now.strftime("%Y-%m-%d")
     month_str = now.strftime("%Y-%m")
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    with db_lock:
+        conn = get_db_connection()
+        c = conn.cursor()
 
-    c.execute("""
-        SELECT COALESCE(SUM(amount), 0) FROM transactions
-        WHERE user_id = ? AND type='out' AND date_day=?
-    """, (user_id, today_str))
-    daily_used = c.fetchone()[0]
+        c.execute("""
+            SELECT COALESCE(SUM(amount), 0) FROM transactions
+            WHERE user_id = ? AND type='out' AND date_day=?
+        """, (user_id, today_str))
+        daily_used = c.fetchone()[0]
 
-    c.execute("""
-        SELECT COALESCE(SUM(amount), 0) FROM transactions
-        WHERE user_id = ? AND type='out' AND date_month=?
-    """, (user_id, month_str))
-    monthly_used = c.fetchone()[0]
+        c.execute("""
+            SELECT COALESCE(SUM(amount), 0) FROM transactions
+            WHERE user_id = ? AND type='out' AND date_month=?
+        """, (user_id, month_str))
+        monthly_used = c.fetchone()[0]
 
-    conn.close()
+        conn.close()
     return round(daily_used, 2), round(monthly_used, 2)
 
 
 def add_transaction(user_id: int, tx_type: str, amount: float, fee: float, note: str):
     now = datetime.now()
     total = round(amount + fee, 2) if tx_type == "out" else round(amount, 2)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO transactions (user_id, type, amount, fee, total, note, date_day, date_month, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        user_id,
-        tx_type,
-        amount,
-        fee,
-        total,
-        note,
-        now.strftime("%Y-%m-%d"),
-        now.strftime("%Y-%m"),
-        now.strftime("%Y-%m-%d %I:%M %p")
-    ))
-    conn.commit()
-    conn.close()
+    with db_lock:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO transactions (user_id, type, amount, fee, total, note, date_day, date_month, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            tx_type,
+            amount,
+            fee,
+            total,
+            note,
+            now.strftime("%Y-%m-%d"),
+            now.strftime("%Y-%m"),
+            now.strftime("%Y-%m-%d %I:%M %p")
+        ))
+        conn.commit()
+        conn.close()
     sync_db_to_github()
 
 
 def get_recent_transactions(user_id: int, limit=15):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        SELECT id, type, amount, fee, total, note, created_at
-        FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT ?
-    """, (user_id, limit))
-    rows = c.fetchall()
-    conn.close()
+    with db_lock:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, type, amount, fee, total, note, created_at
+            FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT ?
+        """, (user_id, limit))
+        rows = c.fetchall()
+        conn.close()
     return rows
 
 
 def delete_last_transaction(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, type, total, note FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,))
-    last = c.fetchone()
-    if last:
-        c.execute("DELETE FROM transactions WHERE id = ?", (last[0],))
-        conn.commit()
-    conn.close()
+    with db_lock:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT id, type, total, note FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,))
+        last = c.fetchone()
+        if last:
+            c.execute("DELETE FROM transactions WHERE id = ?", (last[0],))
+            conn.commit()
+        conn.close()
     if last:
         sync_db_to_github()
     return last
 
 
 def get_admin_stats():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM users")
-    users_count = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM transactions")
-    tx_count = c.fetchone()[0]
-    conn.close()
+    with db_lock:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        users_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM transactions")
+        tx_count = c.fetchone()[0]
+        conn.close()
     return users_count, tx_count
 
 
@@ -298,7 +316,6 @@ def handle_callbacks(call):
     uid = call.from_user.id
     data = call.data
 
-    # زر التحقق من الاشتراك
     if data == "check_sub":
         if is_subscribed(uid):
             register_user(call.from_user)
@@ -313,7 +330,6 @@ def handle_callbacks(call):
             bot.answer_callback_query(call.id, "❌ لم تشترك في القناة بعد! اشترك أولاً ثم اضغط تحقق.", show_alert=True)
         return
 
-    # فحص الاشتراك قبل تنفيذ أي زر آخر
     if not is_subscribed(uid):
         bot.answer_callback_query(call.id, "⚠️ يجب الاشتراك في القناة أولاً!", show_alert=True)
         try:
@@ -451,7 +467,7 @@ def handle_callbacks(call):
         )
 
     elif data == "backup" and is_admin(uid):
-        sync_db_to_github()
+        sync_db_to_github(blocking=True)
         if os.path.exists(DB_PATH):
             with open(DB_PATH, "rb") as f:
                 bot.send_document(
@@ -535,6 +551,6 @@ def handle_inputs(message):
 
 if __name__ == "__main__":
     init_db()
-    sync_db_to_github()
+    sync_db_to_github(blocking=True)
     print("🚀 Multi-user InstaPay-Manager Bot with Force Subscribe is running...")
     bot.infinity_polling(timeout=30, long_polling_timeout=20)
