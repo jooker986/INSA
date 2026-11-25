@@ -11,6 +11,10 @@ from telebot import types
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
+# إعدادات قناة الاشتراك الإجباري
+CHANNEL_USERNAME = "@Jookerrr98"
+CHANNEL_URL = "https://t.me/Jookerrr98"
+
 if not BOT_TOKEN:
     raise ValueError("خطأ: تأكد من إضافة BOT_TOKEN في GitHub Secrets")
 
@@ -52,6 +56,39 @@ def graceful_exit(signum, frame):
 
 signal.signal(signal.SIGINT, graceful_exit)
 signal.signal(signal.SIGTERM, graceful_exit)
+
+
+def is_admin(user_id: int) -> bool:
+    return ADMIN_ID != 0 and user_id == ADMIN_ID
+
+
+def is_subscribed(user_id: int) -> bool:
+    """التحقق من اشتراك المستخدم في القناة"""
+    if is_admin(user_id):
+        return True
+    try:
+        member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception as e:
+        print(f"Subscription check error: {e}")
+        return False
+
+
+def subscription_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("📢 اشترك في القناة أولاً", url=CHANNEL_URL),
+        types.InlineKeyboardButton("✅ تم الاشتراك / تحقق الآن", callback_data="check_sub")
+    )
+    return kb
+
+
+def subscription_text():
+    return (
+        "⚠️ <b>عذراً، يجب الاشتراك في القناة أولاً لاستخدام البوت!</b>\n\n"
+        f"🔹 القناة: {CHANNEL_USERNAME}\n"
+        "اضغط على زر الاشتراك بالأسفل، ثم اضغط على <b>(✅ تم الاشتراك / تحقق الآن)</b>."
+    )
 
 
 def calculate_instapay_fee(amount: float) -> float:
@@ -205,10 +242,6 @@ def get_admin_stats():
     return users_count, tx_count
 
 
-def is_admin(user_id: int) -> bool:
-    return ADMIN_ID != 0 and user_id == ADMIN_ID
-
-
 def main_menu_keyboard(user_id: int):
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -250,17 +283,51 @@ def main_dashboard_text(user_id: int):
 
 @bot.message_handler(commands=["start", "balance"])
 def handle_start(message):
-    register_user(message.from_user)
     uid = message.from_user.id
+    if not is_subscribed(uid):
+        bot.send_message(message.chat.id, subscription_text(), reply_markup=subscription_keyboard())
+        return
+
+    register_user(message.from_user)
     user_states.pop(uid, None)
     bot.send_message(message.chat.id, main_dashboard_text(uid), reply_markup=main_menu_keyboard(uid))
 
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
-    register_user(call.from_user)
     uid = call.from_user.id
     data = call.data
+
+    # زر التحقق من الاشتراك
+    if data == "check_sub":
+        if is_subscribed(uid):
+            register_user(call.from_user)
+            bot.answer_callback_query(call.id, "تم التحقق من اشتراكك بنجاح! أهلاً بك ✅")
+            bot.edit_message_text(
+                main_dashboard_text(uid),
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=main_menu_keyboard(uid)
+            )
+        else:
+            bot.answer_callback_query(call.id, "❌ لم تشترك في القناة بعد! اشترك أولاً ثم اضغط تحقق.", show_alert=True)
+        return
+
+    # فحص الاشتراك قبل تنفيذ أي زر آخر
+    if not is_subscribed(uid):
+        bot.answer_callback_query(call.id, "⚠️ يجب الاشتراك في القناة أولاً!", show_alert=True)
+        try:
+            bot.edit_message_text(
+                subscription_text(),
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=subscription_keyboard()
+            )
+        except Exception:
+            pass
+        return
+
+    register_user(call.from_user)
 
     if data == "refresh":
         user_states.pop(uid, None)
@@ -399,8 +466,12 @@ def handle_callbacks(call):
 
 @bot.message_handler(func=lambda m: True)
 def handle_inputs(message):
-    register_user(message.from_user)
     uid = message.from_user.id
+    if not is_subscribed(uid):
+        bot.send_message(message.chat.id, subscription_text(), reply_markup=subscription_keyboard())
+        return
+
+    register_user(message.from_user)
     state = user_states.get(uid)
 
     if not state:
@@ -465,5 +536,5 @@ def handle_inputs(message):
 if __name__ == "__main__":
     init_db()
     sync_db_to_github()
-    print("🚀 Multi-user InstaPay-Manager Bot is running...")
+    print("🚀 Multi-user InstaPay-Manager Bot with Force Subscribe is running...")
     bot.infinity_polling(timeout=30, long_polling_timeout=20)
